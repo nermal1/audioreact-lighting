@@ -1,0 +1,17 @@
+# Security
+.env
+
+# Virtual Environments
+audioreact_env/
+venv/
+node_modules/
+
+# Mac System Files
+.DS_Store
+
+# Python Caches
+__pycache__/
+*.pyc
+
+# Local Database (Don't upload your personal listening history)
+*.sqlite

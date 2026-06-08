@@ -1,358 +1,232 @@
-"""
-song_identifier.py — Music Identification & Metadata Cache
-
-State machine:
-    LISTENING   → accumulating audio for LISTEN_SECONDS
-    IDENTIFYING → background thread calling AudD API
-    LOCKED      → song known; BPM comes from DB, not detection
-    FALLBACK    → API failed or song unknown; reactive BPM engine takes over
-    COOLDOWN    → brief pause between retries when in FALLBACK
-
-API Chaining:
-    If AudD identifies the Artist/Title but fails to provide the BPM, 
-    the engine will automatically chain a request to the GetSongBPM API 
-    to retrieve the Tempo (BPM) and Key.
-"""
-
+import os
 import io
 import wave
 import time
-import sqlite3
-import hashlib
 import threading
-import numpy as np
-from enum import Enum, auto
-from dataclasses import dataclass
-from typing import Optional
+import queue
 import requests
-import os
+import numpy as np
+from enum import Enum
+from dotenv import load_dotenv
 
-# ------------------------------------------------------------------ #
-#  Configuration — edit these
-# ------------------------------------------------------------------ #
+load_dotenv()
 
-AUDD_API_KEY       = os.getenv('AUDD_API_KEY')  
-GETSONGBPM_API_KEY = os.getenv('GETSONGBPM_API_KEY')
-
-DB_PATH         = 'music_cache.sqlite'
-LISTEN_SECONDS  = 8           
-RETRY_COOLDOWN  = 20.0        
-SAMPLE_RATE     = 44100
-
-
-# ------------------------------------------------------------------ #
-#  State machine
-# ------------------------------------------------------------------ #
 class IDState(Enum):
-    LISTENING   = auto()   
-    IDENTIFYING = auto()   
-    LOCKED      = auto()   
-    FALLBACK    = auto()   
-    COOLDOWN    = auto()   
+    LISTENING = 1
+    IDENTIFYING = 2
+    LOCKED = 3
+    FALLBACK = 4
 
-@dataclass
-class SongMetadata:
-    title:  str
-    artist: str
-    bpm:    float
-    key:    str  = ''
-    source: str  = 'api'   
-
-
-# ------------------------------------------------------------------ #
-#  SQLite cache
-# ------------------------------------------------------------------ #
-def _init_db(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS songs (
-            fingerprint TEXT PRIMARY KEY,
-            title       TEXT NOT NULL,
-            artist      TEXT NOT NULL,
-            bpm         REAL NOT NULL,
-            key         TEXT DEFAULT '',
-            added_at    REAL NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
-
-def _cache_lookup(conn: sqlite3.Connection, fingerprint: str) -> Optional[SongMetadata]:
-    row = conn.execute(
-        "SELECT title, artist, bpm, key FROM songs WHERE fingerprint = ?",
-        (fingerprint,)
-    ).fetchone()
-    if row:
-        return SongMetadata(title=row[0], artist=row[1], bpm=row[2], key=row[3], source='cache')
-    return None
-
-def _cache_insert(conn: sqlite3.Connection, fingerprint: str, meta: SongMetadata) -> None:
-    conn.execute(
-        "INSERT OR REPLACE INTO songs (fingerprint, title, artist, bpm, key, added_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (fingerprint, meta.title, meta.artist, meta.bpm, meta.key, time.time())
-    )
-    conn.commit()
-
-
-# ------------------------------------------------------------------ #
-#  Audio fingerprint
-# ------------------------------------------------------------------ #
-def _fingerprint(audio: np.ndarray) -> str:
-    step   = SAMPLE_RATE // 8000
-    coarse = (audio[::step] * 1000).astype(np.int16).tobytes()
-    return hashlib.md5(coarse).hexdigest()
-
-
-# ------------------------------------------------------------------ #
-#  GetSongBPM API Fallback
-# ------------------------------------------------------------------ #
-def _fetch_getsongbpm_features(title: str, artist: str, api_key: str) -> tuple[float, str]:
-    """Searches GetSongBPM for the track and retrieves its Tempo and Key."""
-    if not api_key:
-        return 0.0, ""
-        
-    # Clean the query strings to improve search accuracy
-    clean_title = title.split('(')[0].split('-')[0].strip()
-    clean_artist = artist.split(',')[0].strip()
-    
-    # GetSongBPM expects the "both" type query to be formatted specifically
-    lookup_str = f"song:{clean_title} artist:{clean_artist}"
-    
-    try:
-        resp = requests.get(
-            "https://getsongbpm.com/api/search/", 
-            params={
-                "api_key": api_key,
-                "type": "both",
-                "lookup": lookup_str,
-                "limit": 1
-            },
-            timeout=5
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        
-        # The API can return the list directly or wrapped in a 'search' key
-        search_results = data if isinstance(data, list) else data.get("search", [])
-        
-        if not search_results:
-            return 0.0, ""
-            
-        track = search_results[0]
-        bpm = float(track.get("tempo", 0.0))
-        key_str = str(track.get("key_of", ""))
-            
-        return bpm, key_str
-        
-    except Exception as e:
-        print(f"[GetSongBPM] Metadata Retrieval Error: {e}")
-        return 0.0, ""
-
-
-# ------------------------------------------------------------------ #
-#  AudD API call
-# ------------------------------------------------------------------ #
-def _encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
-    buf = io.BytesIO()
-    pcm = np.clip(audio, -1.0, 1.0)
-    pcm_int16 = (pcm * 32767).astype(np.int16)
-    with wave.open(buf, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_int16.tobytes())
-    return buf.getvalue()
-
-def _query_audd(audio: np.ndarray, api_key: str) -> Optional[SongMetadata]:
-    wav_bytes = _encode_wav(audio, SAMPLE_RATE)
-    try:
-        resp = requests.post(
-            'https://api.audd.io/',
-            data={'api_token': api_key, 'return': 'spotify,apple_music'},
-            files={'file': ('audio.wav', wav_bytes, 'audio/wav')},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as e:
-        print(f"[SongID] AudD request failed: {e}")
-        return None
-
-    if data.get('status') != 'success' or not data.get('result'):
-        print("[SongID] No match found.")
-        return None
-
-    result = data['result']
-    title  = result.get('title',  'Unknown')
-    artist = result.get('artist', 'Unknown')
-    bpm = 0.0
-    key = ''
-
-    # AudD internal routing attempts
-    spotify = result.get('spotify') or {}
-    if isinstance(spotify, dict):
-        features = spotify.get('audio_features') or {}
-        if isinstance(features, dict):
-            bpm = float(features.get('tempo', 0.0))
-            key_num = features.get('key', -1)
-            mode    = features.get('mode', 1)
-            if isinstance(key_num, int) and key_num >= 0:
-                key_names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
-                key = f"{key_names[key_num % 12]} {'Major' if mode else 'Minor'}"
-
-    if bpm == 0.0:
-        apple = result.get('apple_music') or {}
-        if isinstance(apple, dict):
-            bpm = float(apple.get('tempo', 0.0))
-
-    if bpm == 0.0:
-        bpm = float(result.get('bpm', 0.0))
-
-    return SongMetadata(title=title, artist=artist, bpm=bpm, key=key, source='api')
-
-
-# ------------------------------------------------------------------ #
-#  SongIdentifier 
-# ------------------------------------------------------------------ #
 class SongIdentifier:
-    def __init__(self, api_key: str = AUDD_API_KEY, db_path: str = DB_PATH,
-                 sample_rate: int = SAMPLE_RATE):
-        self.api_key     = api_key
+    def __init__(self, api_key: str, sample_rate: int = 44100):
+        self.api_key = api_key
+        self.getsongbpm_key = os.getenv('GETSONGBPM_API_KEY')
         self.sample_rate = sample_rate
+        
+        self.state = IDState.LISTENING
+        self.bpm_override = None
+        self.use_fallback = True
+        
+        # Track Metadata
+        self.current_song = "Unknown"
+        self.current_artist = "Unknown"
+        self.key_of = ""
+        self.time_sig = ""
+        self.danceability = 50
+        self.acousticness = 0
+        self.genres = []
+        
+        self.last_state_change = time.time()
+        
+        # Silence Detection Setup
+        self.silence_start_time = None
+        self.silence_threshold = 0.005  
+        self.silence_duration_needed = 2.5  
+        
+        self.buffer_lock = threading.Lock()
+        self.audio_buffer = []
+        self.required_samples = sample_rate * 6 
+        
+        self.task_queue = queue.Queue()
+        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker_thread.start()
 
-        self.db   = _init_db(db_path)
-        self.state: IDState                   = IDState.LISTENING
-        self.metadata: Optional[SongMetadata] = None
+    def _set_state(self, new_state: IDState):
+        self.state = new_state
+        self.last_state_change = time.time()
 
-        self._listen_samples = int(LISTEN_SECONDS * sample_rate)
-        self._buffer: list[np.ndarray] = []
-        self._buffer_len = 0
-        self._cooldown_start = 0.0
+    def feed(self, chunk: np.ndarray):
+        # --- SILENCE DETECTION (The Only Way to Reset) ---
+        rms = np.sqrt(np.mean(np.square(chunk)))
+        
+        if rms < self.silence_threshold:
+            if self.silence_start_time is None:
+                self.silence_start_time = time.time()
+            elif time.time() - self.silence_start_time > self.silence_duration_needed:
+                if self.state in (IDState.LOCKED, IDState.FALLBACK, IDState.IDENTIFYING):
+                    print("\n[SongID] 🔇 Sustained silence detected! Resetting for new track...")
+                    self._reset_metadata()
+                    with self.buffer_lock:
+                        self.audio_buffer.clear()
+                    self._set_state(IDState.LISTENING)
+                self.silence_start_time = None 
+        else:
+            self.silence_start_time = None
 
-        self._id_thread: Optional[threading.Thread] = None
-        self._result_pending: Optional[Optional[SongMetadata]] = None  
-        self._result_ready = False
+        # --- Audio Accumulation ---
+        if self.state not in (IDState.LISTENING, IDState.IDENTIFYING):
+            return
 
-        print(f"[SongID] Initialised — state: LISTENING "
-              f"({'API key set' if api_key else 'NO API KEY — fallback only'})")
-
-    @property
-    def bpm_override(self) -> Optional[float]:
-        if self.state == IDState.LOCKED and self.metadata and self.metadata.bpm > 0:
-            return self.metadata.bpm
-        return None
-
-    @property
-    def use_fallback(self) -> bool:
-        return self.state != IDState.LOCKED
-
-    def feed(self, chunk: np.ndarray) -> None:
-        self._check_result()   
-
-        if self.state == IDState.LISTENING:
-            self._buffer.append(chunk)
-            self._buffer_len += len(chunk)
-            if self._buffer_len >= self._listen_samples:
-                self._start_identification()
-
-        elif self.state == IDState.COOLDOWN:
-            if time.monotonic() - self._cooldown_start >= RETRY_COOLDOWN:
-                self._reset_to_listening()
-
-    def reset(self) -> None:
-        print("[SongID] Manual reset — returning to LISTENING")
-        self.metadata = None
-        self._reset_to_listening()
+        with self.buffer_lock:
+            self.audio_buffer.extend(chunk.tolist())
+            if len(self.audio_buffer) >= self.required_samples and self.state == IDState.LISTENING:
+                samples_to_process = np.array(self.audio_buffer[:self.required_samples], dtype=np.float32)
+                self.audio_buffer = self.audio_buffer[int(self.sample_rate * 2):]
+                print("\n[SongID] 6 seconds of audio captured. Sending to AudD...")
+                self._set_state(IDState.IDENTIFYING)
+                self.task_queue.put(samples_to_process)
 
     def status_line(self) -> str:
-        if self.state == IDState.LOCKED and self.metadata:
-            bpm_str = f"{self.metadata.bpm:.1f} BPM" if self.metadata.bpm > 0 else "BPM unknown"
-            key_str = f" · {self.metadata.key}" if self.metadata.key else ""
-            src_str = f" [{self.metadata.source}]"
-            return f"♪ {self.metadata.artist} — {self.metadata.title}  |  {bpm_str}{key_str}{src_str}"
+        if self.state == IDState.LISTENING:
+            return "◉ Listening for song…"
         elif self.state == IDState.IDENTIFYING:
-            return "⟳ Identifying song…"
-        elif self.state == IDState.FALLBACK:
-            return "? Unrecognised — reactive BPM active"
-        elif self.state == IDState.COOLDOWN:
-            elapsed  = time.monotonic() - self._cooldown_start
-            remaining = max(0, RETRY_COOLDOWN - elapsed)
-            return f"↺ Retrying in {remaining:.0f}s — reactive BPM active"
-        else:
-            return f"◉ Listening… ({self._buffer_len / self.sample_rate:.1f}s / {LISTEN_SECONDS}s)"
+            return "⟳ Identifying track via AudD..."
+        elif self.state == IDState.LOCKED:
+            return f"✓ Playing: {self.current_artist} — {self.current_song}"
+        return "⚠️ Unrecognised Audio — Reactive Mode Active"
 
-    def _reset_to_listening(self) -> None:
-        self._buffer     = []
-        self._buffer_len = 0
-        self.state       = IDState.LISTENING
+    def _reset_metadata(self):
+        self.current_song = "Unknown"
+        self.current_artist = "Unknown"
+        self.bpm_override = None
+        self.key_of = ""
+        self.time_sig = ""
+        self.danceability = 50
+        self.acousticness = 0
+        self.genres = []
 
-    def _start_identification(self) -> None:
-        audio = np.concatenate(self._buffer)
-        fp    = _fingerprint(audio)
+    def _convert_to_wav_bytes(self, audio_samples: np.ndarray) -> bytes:
+        int_samples = np.clip(audio_samples * 32767, -32768, 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2) 
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(int_samples.tobytes())
+        return buf.getvalue()
 
-        cached = _cache_lookup(self.db, fp)
-        if cached:
-            print(f"[SongID] Cache hit: {cached.artist} — {cached.title} ({cached.bpm:.1f} BPM)")
-            self.metadata = cached
-            self.state    = IDState.LOCKED
-            return
-
-        if not self.api_key:
-            print("[SongID] No API key — entering FALLBACK")
-            self.state           = IDState.FALLBACK
-            self._cooldown_start = time.monotonic()
-            self._reset_to_listening()
-            self.state = IDState.COOLDOWN
-            return
-
-        self.state          = IDState.IDENTIFYING
-        self._result_ready  = False
-        self._result_pending = None
-
-        self._id_thread = threading.Thread(
-            target=self._identify_worker,
-            args=(audio, fp),
-            daemon=True,
-        )
-        self._id_thread.start()
-
-    def _identify_worker(self, audio: np.ndarray, fingerprint: str) -> None:
-        meta = _query_audd(audio, self.api_key)
+    def _fetch_getsongbpm_fallback(self, title: str, artist: str) -> dict:
+        if not self.getsongbpm_key:
+            return {}
+            
+        clean_title = title.split('(')[0].split('-')[0].strip()
+        clean_artist = artist.split(',')[0].strip()
+        lookup_str = f"song:{clean_title} artist:{clean_artist}"
         
-        if meta:
-            # --- API CHAINING: The GetSongBPM Fallback ---
-            if meta.bpm == 0.0 and GETSONGBPM_API_KEY:
-                print(f"[SongID] AudD found '{meta.title}', but no BPM. Connecting to GetSongBPM Database...")
-                bpm, key = _fetch_getsongbpm_features(meta.title, meta.artist, GETSONGBPM_API_KEY)
-                if bpm > 0:
-                    meta.bpm = bpm
-                    meta.key = key if key else meta.key
-                    print(f"[SongID] GetSongBPM Database Chain Success! Found {meta.bpm} BPM.")
+        print(f"[SongID] ⟳ Chaining request to GetSongBPM for: {clean_artist} — {clean_title}...")
+        try:
+            resp = requests.get(
+                "https://api.getsong.co/search/",
+                params={"api_key": self.getsongbpm_key, "type": "both", "lookup": lookup_str, "limit": 1},
+                headers={"User-Agent": "AudioReact-Lighting/1.0", "Accept": "application/json"},
+                timeout=5
+            )
+            resp.raise_for_status()
+            data = resp.json()
             
-            _cache_insert(self.db, fingerprint, meta)
+            # SAFE PARSING: Prevent 'KeyError: 0' by ensuring it is a populated list
+            search_results = data if isinstance(data, list) else data.get("search", [])
+            if not search_results or not isinstance(search_results, list) or len(search_results) == 0:
+                print(f"[SongID] ℹ️ Track not found in GetSongBPM database.")
+                return {}
+                
+            track = search_results[0]
+            artist_data = track.get("artist", {})
             
-            if meta.bpm > 0:
-                print(f"[SongID] Locked: {meta.artist} — {meta.title} ({meta.bpm:.1f} BPM, {meta.key or '—'})")
-            else:
-                print(f"[SongID] Locked (no BPM): {meta.artist} — {meta.title} — reactive BPM will be used")
-        else:
-            print("[SongID] Could not identify song — entering COOLDOWN")
-            
-        self._result_pending = meta
-        self._result_ready   = True
+            return {
+                "bpm": float(track.get("tempo", 0.0)),
+                "key_of": str(track.get("key_of", "")),
+                "time_sig": str(track.get("time_sig", "")),
+                "danceability": int(track.get("danceability", 50)),
+                "acousticness": int(track.get("acousticness", 0)),
+                "genres": artist_data.get("genres", [])
+            }
+        except Exception as e:
+            print(f"[SongID] ❌ GetSongBPM Fetch Error: {type(e).__name__} - {e}")
+            return {}
 
-    def _check_result(self) -> None:
-        if not self._result_ready:
-            return
-        self._result_ready = False
-        meta = self._result_pending
+    def _worker_loop(self):
+        while True:
+            audio_samples = self.task_queue.get()
+            if audio_samples is None:
+                break
+                
+            wav_bytes = self._convert_to_wav_bytes(audio_samples)
+            
+            try:
+                resp = requests.post(
+                    'https://api.audd.io/',
+                    data={'api_token': self.api_key, 'return': 'spotify,apple_music'},
+                    files={'file': ('audio.wav', wav_bytes, 'audio/wav')},
+                    timeout=15
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                
+                if data.get('status') == 'success' and data.get('result'):
+                    result = data['result']
+                    self.current_song = result.get('title', 'Unknown')
+                    self.current_artist = result.get('artist', 'Unknown')
+                    
+                    bpm = 0.0
+                    spotify = result.get('spotify') or {}
+                    if isinstance(spotify, dict):
+                        features = spotify.get('audio_features') or {}
+                        if isinstance(features, dict):
+                            bpm = float(features.get('tempo', 0.0))
+                            
+                    if bpm == 0.0:
+                        apple = result.get('apple_music') or {}
+                        if isinstance(apple, dict):
+                            bpm = float(apple.get('tempo', 0.0))
+                            
+                    if bpm == 0.0:
+                        bpm = float(result.get('bpm', 0.0))
+                        
+                    bpm_meta = self._fetch_getsongbpm_fallback(self.current_song, self.current_artist)
+                    
+                    if bpm_meta:
+                        self.time_sig = bpm_meta.get("time_sig", "")
+                        self.key_of = bpm_meta.get("key_of", "")
+                        self.danceability = bpm_meta.get("danceability", 50)
+                        self.acousticness = bpm_meta.get("acousticness", 0)
+                        self.genres = bpm_meta.get("genres", [])
+                        
+                        if bpm == 0.0 and bpm_meta.get("bpm", 0.0) > 0:
+                            bpm = bpm_meta.get("bpm")
 
-        if meta:
-            self.metadata = meta
-            self.state    = IDState.LOCKED
-        else:
-            self.metadata        = None
-            self._cooldown_start = time.monotonic()
-            self._reset_to_listening()
-            self.state = IDState.COOLDOWN
+                    if bpm > 0:
+                        print(f"[SongID] ✅ Match: {self.current_artist} — {self.current_song} | {bpm:.1f} BPM")
+                        print(f"[SongID] 📊 Vibe: Dance: {self.danceability} | Acoustic: {self.acousticness} | Genres: {self.genres}")
+                        self.bpm_override = bpm
+                    else:
+                        print(f"[SongID] ⚠️ Found track, but no BPM available. Defaulting to reactive fallback.")
+                        self.bpm_override = None
+
+                    # If we know the song name, we are LOCKED, even if we don't have a BPM.
+                    self.use_fallback = (self.bpm_override is None)
+                    self._set_state(IDState.LOCKED)
+                        
+                else:
+                    print("[SongID] ❌ No match found by AudD. Defaulting to reactive fallback.")
+                    self.bpm_override = None
+                    self.use_fallback = True
+                    self._set_state(IDState.FALLBACK)
+                    
+            except Exception as e:
+                print(f"[SongID] ⚠️ Error during identification: {e}")
+                self.bpm_override = None
+                self.use_fallback = True
+                self._set_state(IDState.FALLBACK)
+                
+            self.task_queue.task_done()
